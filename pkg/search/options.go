@@ -430,6 +430,7 @@ var (
 	AreaOfConcern = newFieldLabel("Area Of Concern")
 
 	// Resource alerts search fields
+	ResourceID   = newFieldLabel("Resource ID")
 	ResourceName = newFieldLabel("Resource")
 	ResourceType = newFieldLabel("Resource Type")
 
