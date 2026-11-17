@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	roleMocks "github.com/stackrox/rox/central/role/datastore/mocks"
+	apiV1 "github.com/stackrox/rox/generated/api/v1"
 	v1 "github.com/stackrox/rox/generated/internalapi/central/v1"
 	"github.com/stackrox/rox/generated/storage"
-	"github.com/stackrox/rox/pkg/auth/permissions"
 	"github.com/stackrox/rox/pkg/auth/tokens"
 	"github.com/stackrox/rox/pkg/defaults/accesscontrol"
 	"github.com/stackrox/rox/pkg/errox"
@@ -81,6 +81,80 @@ func TestCreateSensorRole(t *testing.T) {
 	}
 }
 
+func TestCreateScopedRolesKeepsPermissionsSeparate(t *testing.T) {
+	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+	expectPermissionSetLookup(t, roles, []string{"Deployment Reader", "Image Reader"}, []*storage.PermissionSet{
+		{Name: "Image Reader", ResourceToAccess: map[string]storage.Access{"Image": storage.Access_READ_ACCESS}},
+		{Name: "Deployment Reader", ResourceToAccess: map[string]storage.Access{"Deployment": storage.Access_READ_ACCESS}},
+	}, nil)
+	access, err := (&roleManager{roles}).createScopedRoles(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+		ScopedPermissionSets: []*v1.ScopedPermissionSet{
+			{Name: "Deployment Reader", HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/deployments", Methods: []string{"GET"}}}},
+			{Name: "Image Reader", HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/images", Methods: []string{"GET"}}}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []*tokens.InternalRole{
+		{RoleName: internalRoleName, Permissions: map[storage.Access][]string{storage.Access_READ_ACCESS: {"Deployment"}},
+			HTTPRequestScopes: tokens.HTTPRequestScopes{"/v1/deployments": {"GET"}}},
+		{RoleName: internalRoleName, Permissions: map[storage.Access][]string{storage.Access_READ_ACCESS: {"Image"}},
+			HTTPRequestScopes: tokens.HTTPRequestScopes{"/v1/images": {"GET"}}},
+	}, access)
+}
+
+func TestSensorProxyPermissionSetRequiresBothConstraints(t *testing.T) {
+	for name, tc := range map[string]struct {
+		access storage.AccessConstraint
+		scope  storage.ScopeConstraint
+		valid  bool
+	}{
+		"both": {
+			access: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+			scope:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+			valid:  true,
+		},
+		"neither": {},
+		"read only": {
+			access: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+		},
+		"scoped only": {
+			scope: storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, scoped := range []bool{false, true} {
+				roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+				roles.EXPECT().GetPermissionSetsFiltered(gomock.Any(), gomock.Any()).Return([]*storage.PermissionSet{{
+					Name:             "Reader",
+					ResourceToAccess: map[string]storage.Access{"Deployment": storage.Access_READ_ACCESS},
+					AccessConstraint: tc.access,
+					ScopeConstraint:  tc.scope,
+				}}, nil)
+				manager := &roleManager{roles}
+				var err error
+				if scoped {
+					_, err = manager.createScopedRoles(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+						ScopedPermissionSets: []*v1.ScopedPermissionSet{{
+							Name:              "Reader",
+							HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/deployments", Methods: []string{"GET"}}},
+						}},
+					})
+				} else {
+					_, err = manager.createSensorRole(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+						PermissionSetNames: []string{"Reader"},
+					})
+				}
+				if tc.valid {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, errox.InvalidArgs)
+					assert.ErrorContains(t, err, "must constrain access to read and resources to cluster/namespace")
+				}
+			}
+		})
+	}
+}
+
 func TestCreateSensorRoleFailsClosed(t *testing.T) {
 	manager := &roleManager{}
 	_, err := manager.createSensorRole(t.Context(), nil)
@@ -98,7 +172,7 @@ func TestCreateSensorRoleFailsClosed(t *testing.T) {
 	require.ErrorIs(t, err, errox.NotFound)
 }
 
-func TestCreateSensorRoleResolvesAdministratorSetByName(t *testing.T) {
+func TestCreateSensorRoleResolvesAdministratorSetWithConsoleName(t *testing.T) {
 	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
 	expectPermissionSetLookup(t, roles, []string{accesscontrol.ConsoleProxy}, []*storage.PermissionSet{{
 		Id:   "5e151917-5903-4701-9658-8fe4044c722f",
@@ -112,6 +186,116 @@ func TestCreateSensorRoleResolvesAdministratorSetByName(t *testing.T) {
 			PermissionSetNames: []string{accesscontrol.ConsoleProxy}})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"Deployment"}, role.Permissions[storage.Access_READ_ACCESS])
+}
+
+func TestCreateSensorRoleResolvesByID(t *testing.T) {
+	for name, tc := range map[string]struct {
+		stored *storage.PermissionSet
+		want   error
+	}{
+		"console default": {stored: &storage.PermissionSet{
+			Id:               accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy],
+			Name:             accesscontrol.ConsoleProxy,
+			AccessConstraint: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+			ScopeConstraint:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+			ResourceToAccess: map[string]storage.Access{"Deployment": storage.Access_READ_ACCESS},
+		}},
+		"missing": {want: errox.NotFound},
+		"different name": {stored: &storage.PermissionSet{
+			Id:               accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy],
+			Name:             "unexpected set",
+			AccessConstraint: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+			ScopeConstraint:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+			ResourceToAccess: map[string]storage.Access{"Deployment": storage.Access_READ_ACCESS},
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+			roles.EXPECT().GetPermissionSet(gomock.Any(), accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy]).
+				Return(tc.stored, tc.stored != nil, nil)
+			role, err := (&roleManager{roles}).createSensorRole(t.Context(),
+				&v1.GenerateTokenForPermissionsAndScopeRequest{
+					PermissionSetIds: []string{accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy]}})
+			if tc.want != nil {
+				require.ErrorIs(t, err, tc.want)
+				assert.Nil(t, role)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, []string{"Deployment"}, role.Permissions[storage.Access_READ_ACCESS])
+		})
+	}
+}
+
+func TestCreateSensorRoleRejectsInvalidID(t *testing.T) {
+	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+	_, err := (&roleManager{roles}).createSensorRole(t.Context(),
+		&v1.GenerateTokenForPermissionsAndScopeRequest{PermissionSetIds: []string{"not-a-uuid"}})
+	require.ErrorIs(t, err, errox.InvalidArgs)
+}
+
+func TestCreateScopedRolesResolvesMixedSelectors(t *testing.T) {
+	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+	expectPermissionSetLookup(t, roles, []string{"Image Reader"}, []*storage.PermissionSet{{
+		Id: "image-id", Name: "Image Reader", ResourceToAccess: map[string]storage.Access{"Image": storage.Access_READ_ACCESS},
+	}}, nil)
+	roles.EXPECT().GetPermissionSet(gomock.Any(), accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy]).
+		Return(&storage.PermissionSet{
+			Id: accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy], Name: accesscontrol.ConsoleProxy,
+			AccessConstraint: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+			ScopeConstraint:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+			ResourceToAccess: map[string]storage.Access{"Deployment": storage.Access_READ_ACCESS},
+		}, true, nil)
+	scoped, err := (&roleManager{roles}).createScopedRoles(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+		ScopedPermissionSets: []*v1.ScopedPermissionSet{
+			{Id: accesscontrol.DefaultPermissionSetIDs[accesscontrol.ConsoleProxy],
+				HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/deployments", Methods: []string{"GET"}}}},
+			{Name: "Image Reader",
+				HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/images", Methods: []string{"GET"}}}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Deployment"}, scoped[0].Permissions[storage.Access_READ_ACCESS])
+	assert.Equal(t, []string{"Image"}, scoped[1].Permissions[storage.Access_READ_ACCESS])
+}
+
+func TestCreateScopedRolesRejectsAliasByNameAndID(t *testing.T) {
+	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+	set := &storage.PermissionSet{
+		Id:               "b3070020-ecc3-4f34-a3f6-ad28ffc9b80c",
+		Name:             "Reader",
+		AccessConstraint: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+		ScopeConstraint:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+	}
+	roles.EXPECT().GetPermissionSetsFiltered(gomock.Any(), gomock.Any()).Return([]*storage.PermissionSet{set}, nil)
+	roles.EXPECT().GetPermissionSet(gomock.Any(), set.GetId()).Return(set, true, nil)
+	_, err := (&roleManager{roles}).createScopedRoles(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+		ScopedPermissionSets: []*v1.ScopedPermissionSet{
+			{Name: set.GetName(), HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/a", Methods: []string{"GET"}}}},
+			{Id: set.GetId(), HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/b", Methods: []string{"GET"}}}},
+		},
+	})
+	require.ErrorIs(t, err, errox.InvalidArgs)
+}
+
+func TestCreateScopedRolesAllowsConstrainedSetByIDOnOtherRoute(t *testing.T) {
+	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
+	const metricsID = "b3070020-ecc3-4f34-a3f6-ad28ffc9b80c"
+	roles.EXPECT().GetPermissionSet(gomock.Any(), metricsID).
+		Return(&storage.PermissionSet{
+			Id: metricsID, Name: metricsPermissionSetName,
+			AccessConstraint: storage.AccessConstraint_ACCESS_CONSTRAINT_READ,
+			ScopeConstraint:  storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE,
+		}, true, nil)
+	resolved, err := (&roleManager{roles}).createScopedRoles(t.Context(), &v1.GenerateTokenForPermissionsAndScopeRequest{
+		ClusterScopes: []*v1.ClusterScope{{ClusterId: "sensor-cluster", FullClusterAccess: true}},
+		ScopedPermissionSets: []*v1.ScopedPermissionSet{{
+			Id: metricsID, HttpRequestScopes: []*apiV1.HTTPRequestScope{{Path: "/v1/deployments", Methods: []string{"GET"}}},
+		}},
+	})
+	require.NoError(t, err)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, tokens.HTTPRequestScopes{"/v1/deployments": {"GET"}}, resolved[0].HTTPRequestScopes)
 }
 
 func TestCreateSensorRoleUsesStoredPermissions(t *testing.T) {
@@ -165,7 +349,7 @@ func TestCreateSensorRoleUsesStoredPermissions(t *testing.T) {
 func TestCreateSensorRoleCombinesPermissionSets(t *testing.T) {
 	roles := roleMocks.NewMockDataStore(gomock.NewController(t))
 	expectPermissionSetLookup(t, roles,
-		[]string{accesscontrol.ConsoleProxy, permissions.MetricsPermissionSetName},
+		[]string{accesscontrol.ConsoleProxy, metricsPermissionSetName},
 		[]*storage.PermissionSet{
 			{
 				Name: accesscontrol.ConsoleProxy,
@@ -177,7 +361,7 @@ func TestCreateSensorRoleCombinesPermissionSets(t *testing.T) {
 				},
 			},
 			{
-				Name: permissions.MetricsPermissionSetName,
+				Name: metricsPermissionSetName,
 				ResourceToAccess: map[string]storage.Access{
 					"Deployment":     storage.Access_READ_ACCESS,
 					"Image":          storage.Access_READ_ACCESS,
@@ -190,7 +374,7 @@ func TestCreateSensorRoleCombinesPermissionSets(t *testing.T) {
 	role, err := (&roleManager{roles}).createSensorRole(t.Context(),
 		&v1.GenerateTokenForPermissionsAndScopeRequest{
 			ClusterScopes:      []*v1.ClusterScope{{ClusterId: "sensor-cluster", Namespaces: []string{"*"}}},
-			PermissionSetNames: []string{accesscontrol.ConsoleProxy, permissions.MetricsPermissionSetName},
+			PermissionSetNames: []string{accesscontrol.ConsoleProxy, metricsPermissionSetName},
 		})
 	require.NoError(t, err)
 	assert.Equal(t, &tokens.InternalRole{
@@ -223,10 +407,10 @@ func TestCreateSensorRoleFailsIfAnyPermissionSetCannotBeLoaded(t *testing.T) {
 			}}
 			matches = append(matches, tc.permissionSets...)
 			expectPermissionSetLookup(t, roles,
-				[]string{accesscontrol.ConsoleProxy, permissions.MetricsPermissionSetName}, matches, tc.storeErr)
+				[]string{accesscontrol.ConsoleProxy, metricsPermissionSetName}, matches, tc.storeErr)
 			role, err := (&roleManager{roles}).createSensorRole(t.Context(),
 				&v1.GenerateTokenForPermissionsAndScopeRequest{
-					PermissionSetNames: []string{accesscontrol.ConsoleProxy, permissions.MetricsPermissionSetName}})
+					PermissionSetNames: []string{accesscontrol.ConsoleProxy, metricsPermissionSetName}})
 			assert.Nil(t, role)
 			if tc.storeErr != nil {
 				require.ErrorIs(t, err, tc.storeErr)
