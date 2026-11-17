@@ -362,9 +362,9 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 		"success - console permission set with namespace scope": {
 			input: &v1.GenerateTokenForPermissionsAndScopeRequest{
 				PermissionSetNames: []string{accesscontrol.ConsoleProxy},
-				HttpRequestScopes:  []*apiV1.HTTPRequestScope{{Path: "/api/graphql", Methods: []string{"POST"}}},
 				Permissions:        map[string]v1.Access{"Deployment": v1.Access_READ_WRITE_ACCESS},
 				ClusterScopes:      []*v1.ClusterScope{requestSingleNamespace},
+				HttpRequestScopes:  []*apiV1.HTTPRequestScope{{Path: "/v1/metadata", Methods: []string{"GET"}}},
 				Lifetime:           testExpirationDuration,
 			},
 			policy: permissivePolicy,
@@ -382,7 +382,6 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 								"Deployment": storage.Access_READ_ACCESS,
 								"Image":      storage.Access_READ_ACCESS,
 							},
-							Traits: &storage.Traits{Origin: storage.Traits_DEFAULT},
 						}}, nil
 					})
 				mocks.issuer.EXPECT().Issue(gomock.Any(), tokens.RoxClaims{
@@ -395,7 +394,7 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 					}},
 					Name: fmt.Sprintf(claimNameFormat, internalRoleName,
 						testTokenExpiry.Format(time.RFC3339Nano)),
-					HTTPRequestScopes: tokens.HTTPRequestScopes{"/api/graphql": {"POST"}},
+					HTTPRequestScopes: tokens.HTTPRequestScopes{"/v1/metadata": {"GET"}},
 				}, gomock.Any()).Return(&tokens.TokenInfo{Token: "console-token"}, nil)
 			},
 			expectedRsp: &v1.GenerateTokenForPermissionsAndScopeResponse{Token: "console-token"},
@@ -403,8 +402,8 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 		"success - duplicate permission set names": {
 			input: &v1.GenerateTokenForPermissionsAndScopeRequest{
 				PermissionSetNames: []string{accesscontrol.ConsoleProxy, accesscontrol.ConsoleProxy},
-				HttpRequestScopes:  []*apiV1.HTTPRequestScope{{Path: "/api/graphql", Methods: []string{"POST"}}},
 				ClusterScopes:      []*v1.ClusterScope{requestSingleNamespace},
+				HttpRequestScopes:  []*apiV1.HTTPRequestScope{{Path: "/v1/deployments", Methods: []string{"GET"}}},
 				Lifetime:           testExpirationDuration,
 			},
 			policy: permissivePolicy,
@@ -427,7 +426,7 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 					}},
 					Name: fmt.Sprintf(claimNameFormat, internalRoleName,
 						testTokenExpiry.Format(time.RFC3339Nano)),
-					HTTPRequestScopes: tokens.HTTPRequestScopes{"/api/graphql": {"POST"}},
+					HTTPRequestScopes: tokens.HTTPRequestScopes{"/v1/deployments": {"GET"}},
 				}, gomock.Any()).Return(&tokens.TokenInfo{Token: "combined-token"}, nil)
 			},
 			expectedRsp: &v1.GenerateTokenForPermissionsAndScopeResponse{Token: "combined-token"},
@@ -676,6 +675,83 @@ func TestGenerateTokenForPermissionsAndScope(t *testing.T) {
 			assert.NotNil(it, rsp)
 			protoassert.Equal(it, tc.expectedRsp, rsp)
 			assert.NoError(it, err)
+		})
+	}
+}
+
+func TestGenerateTokenForGenericPermissionSet(t *testing.T) {
+	const permissionSetName = "custom-read-only-set"
+	for name, tc := range map[string]struct {
+		permissions map[string]storage.Access
+		expectedErr error
+		constrained bool
+	}{
+		"read-only set is signed": {
+			permissions: map[string]storage.Access{
+				"Image": storage.Access_READ_ACCESS, "Administration": storage.Access_NO_ACCESS,
+			},
+			constrained: true,
+		},
+		"unconstrained set is not signed": {
+			permissions: map[string]storage.Access{"Image": storage.Access_READ_ACCESS},
+			expectedErr: errox.InvalidArgs,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			roles := roleDataStoreMocks.NewMockDataStore(ctrl)
+			issuer := tokensMocks.NewMockIssuer(ctrl)
+			permissionSet := &storage.PermissionSet{Name: permissionSetName, ResourceToAccess: tc.permissions}
+			if tc.constrained {
+				permissionSet.AccessConstraint = storage.AccessConstraint_ACCESS_CONSTRAINT_READ
+				permissionSet.ScopeConstraint = storage.ScopeConstraint_SCOPE_CONSTRAINT_CLUSTER_NAMESPACE
+			}
+			roles.EXPECT().GetPermissionSetsFiltered(gomock.Any(), gomock.Any()).
+				Return([]*storage.PermissionSet{permissionSet}, nil)
+			if tc.expectedErr == nil {
+				issuer.EXPECT().Issue(gomock.Any(), tokens.RoxClaims{
+					InternalRoles: []*tokens.InternalRole{{
+						RoleName: internalRoleName,
+						Clusters: tokens.ClusterScopes{fixtureconsts.Cluster1: {"prod"}},
+						Permissions: map[storage.Access][]string{
+							storage.Access_READ_ACCESS: {"Image"}, storage.Access_NO_ACCESS: {"Administration"},
+						},
+					}},
+					Name: fmt.Sprintf(claimNameFormat, internalRoleName,
+						testClock().Add(time.Hour).Format(time.RFC3339Nano)),
+					Requester: "sensor proxy",
+					HTTPRequestScopes: tokens.HTTPRequestScopes{
+						"/v1/images/": {"GET"}, "/v1/images/private": {},
+					},
+				}, gomock.Any()).Return(&tokens.TokenInfo{Token: "generic-token"}, nil)
+			}
+			svc := &serviceImpl{
+				issuer: issuer, roleManager: &roleManager{roles},
+				now: testClock, policy: defaultTokenPolicy(),
+			}
+			req := &v1.GenerateTokenForPermissionsAndScopeRequest{
+				PermissionSetNames: []string{permissionSetName},
+				Permissions:        map[string]v1.Access{"Image": v1.Access_READ_WRITE_ACCESS},
+				ClusterScopes: []*v1.ClusterScope{{
+					ClusterId: fixtureconsts.Cluster1, Namespaces: []string{"prod"},
+				}},
+				HttpRequestScopes: []*apiV1.HTTPRequestScope{
+					{Path: "/v1/images/", Methods: []string{"GET"}},
+					{Path: "/v1/images/private"},
+				},
+				Lifetime:  durationpb.New(2 * time.Hour),
+				Requester: "sensor proxy",
+			}
+			ctx := sensorContext(t, ctrl, fixtureconsts.Cluster1)
+			response, err := svc.GenerateTokenForPermissionsAndScope(ctx, req)
+			if tc.expectedErr != nil {
+				assert.Nil(t, response)
+				assert.ErrorIs(t, err, tc.expectedErr)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, "generic-token", response.GetToken())
+			assert.Equal(t, 2*time.Hour, req.GetLifetime().AsDuration())
 		})
 	}
 }
