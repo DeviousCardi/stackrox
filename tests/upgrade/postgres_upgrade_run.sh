@@ -459,8 +459,6 @@ test_scanner_v4_db_upgrade_fallback() {
     restore_backup
     wait_for_api
 
-    kubectl -n stackrox rollout status deploy/scanner-v4-db --timeout=600s
-
     cd "$TEST_ROOT"
 
     # Restarting scanner-v4-db drops the indexer's and matcher's connections.
@@ -481,11 +479,18 @@ test_scanner_v4_db_upgrade_fallback() {
     scanner_v4_db_psql "ALTER DATABASE $SCANNER_V4_UPGRADE_BLOCKER WITH ALLOW_CONNECTIONS false"
 
     wait_for_scanner_v4_readiness
-    info "Upgrade scanner-v4-db ${EARLIER_TAG} => ${CURRENT_TAG}"
+
+    # Upgrade the images
+    info "Upgrade ${EARLIER_TAG} => ${CURRENT_TAG}"
+    kubectl -n stackrox set image deploy/central "*=${REGISTRY}/main:${CURRENT_TAG}"
+    kubectl -n stackrox set image deploy/central-db "*=${REGISTRY}/central-db:${CURRENT_TAG}"
     kubectl -n stackrox set image deploy/scanner-v4-db "*=${REGISTRY}/scanner-v4-db:${CURRENT_TAG}"
+    kubectl -n stackrox set image deploy/scanner-v4-indexer "*=${REGISTRY}/scanner-v4:${CURRENT_TAG}"
+    kubectl -n stackrox set image deploy/scanner-v4-matcher "*=${REGISTRY}/scanner-v4:${CURRENT_TAG}"
+    wait_for_api
 
     # The pod should come up instead of aborting and crashlooping.
-    kubectl -n stackrox rollout status deploy/scanner-v4-db --timeout=600s
+    wait_for_scanner_v4_readiness
 
     local init_log
     init_log="$(kubectl -n stackrox logs deploy/scanner-v4-db -c init-db)"
@@ -496,14 +501,14 @@ test_scanner_v4_db_upgrade_fallback() {
         die "scanner-v4-db did not decline the upgrade the way this test intends"
 
     test_equals_non_silent "$(scanner_v4_db_pg_version)" "$SCANNER_V4_DB_EARLIER_PG"
-    wait_for_scanner_v4_readiness
 
     info "Removing the blocker and restarting scanner-v4-db"
     scanner_v4_db_psql "DROP DATABASE $SCANNER_V4_UPGRADE_BLOCKER"
     kubectl -n stackrox rollout restart deploy/scanner-v4-db
     kubectl -n stackrox rollout status deploy/scanner-v4-db --timeout=600s
-    check_scanner_v4_db_upgraded
+
     wait_for_scanner_v4_readiness
+    check_scanner_v4_db_upgraded
 
     local old_pod new_pod=""
     old_pod="$(scanner_v4_db_pod)"
@@ -515,10 +520,15 @@ test_scanner_v4_db_upgrade_fallback() {
         sleep 2
     done
     [[ -n "$new_pod" ]] || die "scanner-v4-db was not recreated after the bounce"
-    kubectl -n stackrox wait --for=condition=Ready "po/$new_pod" --timeout=600s
 
-    check_scanner_v4_db_upgraded
     wait_for_scanner_v4_readiness
+    check_scanner_v4_db_upgraded
+
+    info "Verifying ACS operational readiness after fallback mode"
+    wait_for_api
+    sensor_wait
+    wait_for_central_reconciliation
+    checkForPostgresAccessScopes
 
     collect_and_check_stackrox_logs "$log_output_dir" "scanner_v4_db_fallback_final"
 }
