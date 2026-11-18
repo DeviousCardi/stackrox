@@ -461,6 +461,8 @@ test_scanner_v4_db_upgrade_fallback() {
 
     cd "$TEST_ROOT"
 
+    kubectl -n stackrox rollout status deploy/scanner-v4-db --timeout=600s
+
     # Restarting scanner-v4-db drops the indexer's and matcher's connections.
     cp scripts/ci/logcheck/allowlist-patterns /tmp/allowlist-patterns
     {
@@ -520,6 +522,7 @@ test_scanner_v4_db_upgrade_fallback() {
         sleep 2
     done
     [[ -n "$new_pod" ]] || die "scanner-v4-db was not recreated after the bounce"
+    kubectl -n stackrox wait --for=condition=Ready "po/$new_pod" --timeout=600s
 
     wait_for_scanner_v4_readiness
     check_scanner_v4_db_upgraded
