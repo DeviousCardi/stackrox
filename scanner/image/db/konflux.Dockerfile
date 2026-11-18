@@ -34,7 +34,12 @@ COPY \
      scanner/image/db/scripts/cert-watcher.sh \
      /usr/local/bin/
 
-RUN localedef -f UTF-8 -i en_US en_US.UTF-8 && \
+RUN mkdir -p /pg15-install && \
+    dnf install -y --installroot=/pg15-install \
+        postgresql15-uuid-ossp && \
+    cp /pg15-install/usr/lib64/pgsql/*.so /usr/lib64/pgsql/postgresql-15/lib/ && \
+    rm -rf /pg15-install && \
+    localedef -f UTF-8 -i en_US en_US.UTF-8 && \
     mkdir -p /var/lib/postgresql && \
     groupmod -g 70 postgres && \
     usermod -u 70 postgres -d /var/lib/postgresql && \
